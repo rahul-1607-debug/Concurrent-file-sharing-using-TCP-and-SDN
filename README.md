@@ -2,6 +2,21 @@
 
 A concurrent file-sharing system built using Python TCP sockets and Software-Defined Networking (SDN). The system supports multiple simultaneous file transfers, secure authentication, role-based access control, file integrity verification, bandwidth monitoring, and network-level access policies.
 
+## Team Members
+
+| Name | SRN |
+|--------------|----------------|
+| Prajwal J Kumar | PES1UG25AM276 |
+| Rahul S | PES1UG25AM299 |
+| Suchitha M | PES1UG26AM816 |
+
+**Institution:** PES University  
+**Department:** Computer Science and Engineering (AI & ML)  
+**Subject:** Computer Networks  
+**Submitted to:** Dr Mohammad Asif Raibag
+
+---
+
 ## 1. Features
 
 - **Concurrent TCP File Transfers:** Supports multiple clients simultaneously using multithreading.
@@ -13,7 +28,7 @@ A concurrent file-sharing system built using Python TCP sockets and Software-Def
 - **Bandwidth Monitoring:** Tracks network traffic and calculates bandwidth usage per connection and client.
 - **File Integrity Verification:** Uses SHA-256 checksums to verify transferred files.
 - **Concurrent Transfer Testing:** Supports simultaneous upload and download testing.
-
+  
 ## 2. System Architecture
 
 ```text
