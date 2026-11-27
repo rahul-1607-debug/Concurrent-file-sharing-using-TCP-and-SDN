@@ -1,0 +1,36 @@
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+env/
+.venv/
+ENV/
+
+# IDE and editor files
+.vscode/
+.idea/
+.DS_Store
+
+# Temporary files
+*.tmp
+*.log
+*.swp
+*.bak
+
+# Generated test files
+*.bin
+
+# Sensitive credentials and environment variables
+.env
+.env.*
+*.pem
+*.key
+
+# Python test and build artifacts
+.pytest_cache/
+build/
+dist/
+*.egg-info/
