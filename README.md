@@ -1,114 +1,331 @@
-# Assignment 14 – Concurrent File Sharing System (TCP + SDN)
+# Concurrent File Sharing System (TCP + SDN)
 
-## 1. What the assignment asks, and where each point is solved
+A concurrent file-sharing system built using Python TCP sockets and Software-Defined Networking (SDN). The system supports multiple simultaneous file transfers, secure authentication, role-based access control, file integrity verification, bandwidth monitoring, and network-level access policies.
 
-| Requirement | Where / how |
-|---|---|
-| Concurrent TCP file transfers | `server.py` – `accept()` loop starts **one thread per client** |
-| Upload and download | `UPLOAD` / `DOWNLOAD` commands, files streamed in 64 KB chunks |
-| Maintain file metadata | `metadata.json` – owner, size, SHA-256, upload time, download count |
-| Authenticated access | Challenge-response login (PBKDF2 + HMAC), roles admin/user/readonly |
-| Apply SDN access policies | `sdn_controller.py` – block a host, rate-limit a host (OpenFlow meters) |
-| Monitor bandwidth | Controller polls flow stats -> Mbps per connection and per client; server also logs `transfers.csv` |
-| Test simultaneous transfers | `test_concurrent.py` + parallel clients inside Mininet |
+## 1. Features
 
-## 2. Architecture
+- **Concurrent TCP File Transfers:** Supports multiple clients simultaneously using multithreading.
+- **File Upload and Download:** Transfers files in 64 KB chunks for efficient memory usage.
+- **File Metadata Management:** Maintains file owner, size, SHA-256 checksum, upload timestamp, and download count.
+- **Secure Authentication:** Implements challenge-response authentication using PBKDF2 and HMAC.
+- **Role-Based Access Control:** Supports Admin, User, and Read-only roles.
+- **SDN-Based Access Policies:** Blocks selected hosts and applies bandwidth restrictions using OpenFlow meters.
+- **Bandwidth Monitoring:** Tracks network traffic and calculates bandwidth usage per connection and client.
+- **File Integrity Verification:** Uses SHA-256 checksums to verify transferred files.
+- **Concurrent Transfer Testing:** Supports simultaneous upload and download testing.
 
-```
+## 2. System Architecture
+
+```text
  h2 (bob)  ─┐
- h3 (carol)─┼── s1 (Open vSwitch) ── h1: server.py  (TCP :9000)
- h4 (guest)─┘        │
-                     └── Ryu controller: forwarding + policies + monitoring
+ h3 (carol)─┼── s1 (Open vSwitch) ── h1: File Server
+ h4 (guest)─┘        │                 TCP Port: 9000
+                     │
+              Ryu SDN Controller
+              - Traffic Forwarding
+              - Access Policies
+              - Bandwidth Monitoring
 ```
-Two layers of control:
-* **Application layer (server.py)** – *who you are* and *what you may do* (login, roles, file ownership).
-* **Network layer (SDN controller)** – *whether your packets are allowed or how fast they go* (drop rules, meters, counters).
-They are independent: a host blocked by SDN never even reaches the login prompt.
 
-## 3. Protocol design (common.py)
-TCP is a **byte stream**, not messages, so we must frame our own messages:
-`[4-byte length][JSON]`, then (for file data) exactly `size` raw bytes. `recv_exact()`
-loops until all N bytes arrived, because one `recv()` may return fewer.
+The system operates through two independent control layers:
 
-Upload: `UPLOAD{name,size,sha256}` -> server `ok` -> client streams bytes -> server `ok{sha256}`.
-Download: `DOWNLOAD{name}` -> server `ok{size,sha256}` -> server streams bytes -> client verifies hash.
+**Application Layer (`server.py`)**
+- User authentication
+- Role-based permissions
+- File ownership and access control
+- Upload and download management
 
-## 4. Concurrency (how and why it is safe)
-* Thread per connection: a slow client blocks only its own thread.
-* **Shared state** is the metadata dictionary/file. All reads/writes are inside `meta_lock`
-  (a mutex) so two simultaneous uploads cannot corrupt `metadata.json` (race condition).
-* Uploads are written to a **temporary file** and `os.replace()`d into place only when complete and
-  checksum-verified -> a half-uploaded or dropped file never appears in the listing, and a
-  download in progress is not damaged if the file is overwritten (POSIX keeps the old inode open).
-* Files are streamed in chunks, so memory use is constant even for 1 GB files.
-* Alternatives to mention in your report: `ThreadPoolExecutor` (bounded threads), `asyncio`/`selectors` (event-driven, scales to thousands of clients).
+**Network Layer (`sdn_controller.py`)**
+- Host blocking
+- Bandwidth rate limiting
+- Traffic monitoring
+- OpenFlow rule management
 
-## 5. Authentication and access control
-* Passwords are never stored: server keeps `salt` + `PBKDF2-HMAC-SHA256(password, salt, 100000)`.
-* Login is **challenge-response**: server sends a random nonce; client answers `HMAC(key, nonce)`.
-  The password is never sent, and a replayed answer is useless (new nonce every time).
-* Unknown users get a fake salt, so an attacker cannot tell which usernames exist.
-* Roles: `admin` (everything), `user` (upload/download/list), `readonly` (download/list).
-  Delete only for the file owner or admin.
-* File names are whitelisted by regex (blocks `../../etc/passwd` path traversal).
-* Default accounts (created on first run): alice/alice123 (admin), bob/bob123, carol/carol123 (user), guest/guest123 (readonly).
-* Limitation (state this honestly): file *contents* are not encrypted. Real deployment -> wrap the socket in TLS (`ssl.wrap_socket`).
+## 3. Protocol Design
 
-## 6. SDN part (sdn_controller.py)
-Controller = Ryu, protocol = OpenFlow 1.3, switch = Open vSwitch in Mininet.
+The system uses TCP sockets for communication.
 
-1. **Learning switch** – packet-in -> remember `mac -> port`, install a flow so later packets stay in the data plane.
-2. **Block policy** – at switch connection, install a priority-200 flow matching
-   `ipv4_src=h4, ipv4_dst=server, tcp_dst=9000` with **no actions = drop**. (h4 can still ping, only the file service is denied.)
-3. **Rate-limit policy** – an OpenFlow **meter** with a *drop band* at 5 Mbps for h3. Flows of h3's file
-   transfers reference the meter, so the switch enforces the cap in hardware speed, not the controller.
-4. **Monitoring** – for every TCP connection to port 9000 the controller installs its own flow
-   (match on full 5-tuple). `OFPFlowStatsRequest` every 2 s returns `byte_count`;
-   `Mbps = Δbytes × 8 / Δtime / 1e6`. Results are printed and saved to `sdn_bandwidth.csv`.
+Since TCP provides a continuous byte stream rather than individual messages, a length-prefixed framing mechanism is implemented.
 
-Policies are edited at the top of the file (`BLOCKED_HOSTS`, `RATE_LIMITS_KBPS`).
+Message format:
 
-## 7. How to run
-
-**A. Quick functional test, no SDN (any machine):**
+```text
+[4-byte message length][JSON message]
 ```
-python3 server.py                                   # terminal 1
-python3 test_concurrent.py -n 6 --size 20           # terminal 2
+
+File data is transferred as raw bytes after the initial metadata exchange.
+
+**Upload Process:**
+1. Client sends an UPLOAD request containing the filename, file size, and SHA-256 checksum.
+2. Server validates the request and responds.
+3. Client streams the file in chunks.
+4. Server verifies the checksum and stores the completed file.
+5. Server updates the metadata.
+
+**Download Process:**
+1. Client sends a DOWNLOAD request.
+2. Server responds with file size and checksum.
+3. Server streams the file to the client.
+4. Client verifies the downloaded file using SHA-256.
+
+## 4. Concurrency and Thread Safety
+
+The server uses a thread-per-client architecture.
+
+- Each client connection is handled by an independent thread.
+- Slow clients do not block other active connections.
+- A mutex (`meta_lock`) protects shared metadata from race conditions.
+- Files are initially written to temporary files.
+- `os.replace()` moves completed and verified files into their final location.
+- Data is streamed in chunks, keeping memory consumption independent of file size.
+
+Alternative concurrency approaches include:
+- `ThreadPoolExecutor`
+- `asyncio`
+- `selectors`
+
+## 5. Authentication and Access Control
+
+The authentication system uses PBKDF2-HMAC-SHA256 and challenge-response verification.
+
+**Security mechanisms:**
+- Passwords are not stored directly.
+- Password-derived keys are generated using PBKDF2 with a unique salt and 100,000 iterations.
+- HMAC-based challenge-response authentication prevents passwords from being transmitted directly.
+- Random nonces help prevent replay attacks.
+- Unknown usernames receive a fake salt to reduce username enumeration.
+- File names are validated to prevent path traversal attacks.
+
+**User Roles:**
+
+| Role | Permissions |
+|---|---|
+| Admin | Full access |
+| User | Upload, download, and list files |
+| Read-only | Download and list files |
+
+File deletion is restricted to the file owner or an administrator.
+
+**Default Test Accounts:**
+
+| Username | Password | Role |
+|---|---|---|
+| alice | alice123 | Admin |
+| bob | bob123 | User |
+| carol | carol123 | User |
+| guest | guest123 | Read-only |
+
+*Security Note:* File contents are not encrypted during transmission. TLS should be implemented for secure deployment.
+
+## 6. Software-Defined Networking (SDN)
+
+The SDN implementation uses:
+
+- **Controller:** Ryu / OS-Ken
+- **Protocol:** OpenFlow 1.3
+- **Virtual Switch:** Open vSwitch
+- **Network Emulator:** Mininet
+
+### 6.1 Learning Switch
+
+The controller learns MAC addresses and their corresponding switch ports.
+
+It installs forwarding rules so subsequent packets can be handled directly by the switch.
+
+### 6.2 Host Blocking
+
+Selected hosts can be denied access to the file-sharing service using high-priority OpenFlow rules.
+
+For example, h4 is blocked from accessing the server on TCP port 9000 while other network communication remains available.
+
+### 6.3 Bandwidth Rate Limiting
+
+OpenFlow meters enforce bandwidth restrictions.
+
+For example, h3 can be configured with a 5 Mbps bandwidth limit.
+
+The switch enforces the restriction using a meter with a drop band.
+
+### 6.4 Bandwidth Monitoring
+
+The controller periodically requests flow statistics from the switch using `OFPFlowStatsRequest`.
+
+Bandwidth is calculated using changes in byte counters over time:
+
+```text
+Mbps = (Change in bytes × 8) / (Time interval × 1,000,000)
+```
+
+Monitoring information is displayed in the controller logs and saved to `sdn_bandwidth.csv`.
+
+Policies can be configured using:
+
+- `BLOCKED_HOSTS`
+- `RATE_LIMITS_KBPS`
+
+## 7. Technologies Used
+
+| Technology | Purpose |
+|---|---|
+| Python | Server, client, and controller implementation |
+| TCP Sockets | Reliable network communication |
+| Multithreading | Concurrent client handling |
+| JSON | Message framing and metadata storage |
+| SHA-256 | File integrity verification |
+| PBKDF2 and HMAC | Authentication |
+| Ryu / OS-Ken | SDN controller |
+| OpenFlow 1.3 | Network flow management |
+| Open vSwitch | Software-based switching |
+| Mininet | Virtual network topology |
+
+## 8. Installation and Execution
+
+### A. Functional Testing (Without SDN)
+
+Start the server:
+
+```bash
+python3 server.py
+```
+
+Run concurrent transfer tests:
+
+```bash
+python3 test_concurrent.py -n 6 --size 20
+```
+
+List available files:
+
+```bash
 python3 client.py -u bob -p bob123 list
+```
+
+Upload a file:
+
+```bash
 python3 client.py -u bob -p bob123 upload myfile.pdf
+```
+
+Download a file:
+
+```bash
 python3 client.py -u guest -p guest123 download myfile.pdf -o /tmp
 ```
 
-**B. Full SDN experiment (Ubuntu with Mininet, Open vSwitch, Ryu):**
+### B. SDN Experiment (Ubuntu with Mininet)
+
+Install the required dependencies:
+
+```bash
+sudo apt install mininet openvswitch-switch
+pip install ryu
 ```
-sudo apt install mininet openvswitch-switch && pip install ryu    # (Ryu may need Python 3.9 or an older eventlet)
-# terminal 1
+
+**Terminal 1 – Start the SDN Controller**
+
+```bash
 ryu-manager sdn_controller.py
-# terminal 2
-sudo python3 topology.py
-mininet> h1 python3 server.py &
-mininet> h2 python3 test_concurrent.py --host 10.0.0.1 -n 3 --size 30   # normal, shows sharing of 100 Mbps link
-mininet> h3 python3 client.py --host 10.0.0.1 -u carol -p carol123 upload big.bin   # capped ~5 Mbps
-mininet> h4 python3 client.py --host 10.0.0.1 -u guest -p guest123 list             # times out: blocked by SDN
-mininet> sh ovs-ofctl -O OpenFlow13 dump-flows s1          # show your report the installed rules
 ```
-Make a large file first: `head -c 50M /dev/urandom > big.bin`.
 
-## 8. Experiments to put in your report
-1. 1 client vs 3 vs 6 simultaneous clients: plot aggregate and per-client Mbps (shows fair sharing).
-2. Same upload from h2 (unrestricted) vs h3 (5 Mbps meter): compare times and the controller's BANDWIDTH log.
-3. h4 connection attempt: blocked at network layer; contrast with `guest` on h2 who connects but is denied UPLOAD by the server (application layer).
-4. Wrong password -> `authentication failed`.
-5. Screenshots: `dump-flows`, `sdn_bandwidth.csv` graph, `transfers.csv`.
+**Terminal 2 – Start the Mininet Topology**
 
-Result I measured on localhost (6 clients x 20 MB, all simultaneously): 6/6 finished, SHA-256 intact for every file, ~300-450 Mbps up / ~150-220 Mbps down each.
-(The SDN files were syntax-checked but need Mininet + Ryu to run; I could not run those here, so test them on your VM and adjust IPs/ports if needed.)
+```bash
+sudo python3 topology.py
+```
 
-## 9. Likely viva questions
-* *Why threads, not processes?* I/O-bound work, shared memory for metadata, cheap to create. (GIL is released during socket I/O.)
-* *Why length-prefix?* TCP has no message boundaries.
-* *What is a race condition here?* Two uploads updating metadata at once -> lost update; fixed by the lock.
-* *Control plane vs data plane?* Controller decides (packet-in, flow-mod); switch forwards by flow table.
-* *Reactive vs proactive rules?* Drop/meter rules are proactive (installed at connect); forwarding flows are reactive (on first packet).
-* *Why does the meter limit TCP but not break it?* Drops cause TCP congestion control to slow down to the allowed rate.
-* *Weakness?* No TLS, thread-per-client limit, single switch, metadata in a JSON file (use a database at scale).
+Inside Mininet:
+
+Start the file server on h1:
+
+```bash
+mininet> h1 python3 server.py &
+```
+
+Test simultaneous transfers from h2:
+
+```bash
+mininet> h2 python3 test_concurrent.py --host 10.0.0.1 -n 3 --size 30
+```
+
+Test bandwidth restriction on h3:
+
+```bash
+mininet> h3 python3 client.py --host 10.0.0.1 -u carol -p carol123 upload big.bin
+```
+
+Test network-level blocking on h4:
+
+```bash
+mininet> h4 python3 client.py --host 10.0.0.1 -u guest -p guest123 list
+```
+
+Inspect installed OpenFlow rules:
+
+```bash
+mininet> sh ovs-ofctl -O OpenFlow13 dump-flows s1
+```
+
+Generate a sample 50 MB file:
+
+```bash
+head -c 50M /dev/urandom > big.bin
+```
+
+*Note: Ryu may require an older Python environment depending on the installed eventlet version.*
+
+## 9. Performance Testing and Results
+
+The system was tested with multiple simultaneous TCP clients.
+
+**Localhost Test:**
+- Number of simultaneous clients: 6
+- File size per client: 20 MB
+- Successful transfers: 6/6
+- SHA-256 integrity verification: Successful for all files
+- Observed upload throughput: Approximately 300–450 Mbps
+- Observed download throughput: Approximately 150–220 Mbps
+
+**Additional Experiments:**
+
+1. Compare bandwidth with 1, 3, and 6 simultaneous clients.
+2. Compare unrestricted transfers with transfers subject to a 5 Mbps meter.
+3. Test network-level host blocking.
+4. Verify application-level permission restrictions using read-only accounts.
+5. Test authentication with incorrect passwords.
+6. Inspect OpenFlow rules and bandwidth monitoring logs.
+
+The SDN implementation has been syntax-checked. Full Mininet and Ryu execution and performance measurements should be validated in the target environment.
+
+## 10. Limitations and Future Improvements
+
+- Implement TLS encryption for file transfers.
+- Replace JSON-based metadata storage with a database.
+- Introduce bounded thread pools for improved scalability.
+- Extend monitoring with a graphical dashboard.
+- Support multiple switches and more complex network topologies.
+- Improve bandwidth allocation and traffic management policies.
+
+## 11. Repository Structure
+
+```text
+Concurrent-File-Sharing-System/
+│
+├── server.py
+├── client.py
+├── common.py
+├── sdn_controller.py
+├── topology.py
+├── test_concurrent.py
+│
+├── metadata.json
+├── transfers.csv
+├── sdn_bandwidth.csv
+│
+└── README.md
+```
+
+*The repository may also contain supporting configuration files, test files, and generated storage directories.*
+
+---
+
+**Concurrent File Sharing System using TCP and Software-Defined Networking (SDN).**
